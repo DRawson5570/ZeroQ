@@ -475,15 +475,23 @@ class HeteroZeroQParameter:
             torch.cuda.empty_cache()
 
         # ── 4-bit compute mode: keep as Params4bit, no fp16 dequant ──
-        if self.compute_in_4bit and self.module is not None and self.param_name is not None:
+        # Only applies to Linear4bit layers — embeddings, layernorms etc. must
+        # be dequantized to fp16 since they can't use bnb's fused matmul_4bit.
+        if (self.compute_in_4bit and self.module is not None and self.param_name is not None
+                and isinstance(self.module, bnb.nn.Linear4bit)):
             # Create a bnb Params4bit — bnb's Linear4bit.forward() will use
-            # its fused matmul_4bit kernel, never materializing an fp16 copy
+            # its fused matmul_4bit kernel, never materializing an fp16 copy.
+            # bnb quantize_4bit stores packed data as [N, 1] (2-D), and
+            # Linear4bit.forward() calls self.weight.t() expecting [1, N].
+            # Our assembled_packed is flat [N], so reshape to [N, 1].
+            packed_2d = self._assembled_packed.clone().view(-1, 1)
             param_4bit = bnb.nn.Params4bit(
-                self._assembled_packed.clone(),
+                packed_2d,
                 requires_grad=False,
                 quant_state=gathered_state,
                 quant_type=self._quant_meta["quant_type"],
                 blocksize=self._quant_meta["blocksize"],
+                bnb_quantized=True,
             )
             setattr(self.module, self.param_name, param_4bit)
             self.param = param_4bit
