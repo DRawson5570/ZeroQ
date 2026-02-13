@@ -26,6 +26,11 @@ Standard ZeRO-3:           ZeRO-Q:
 
 **Result:** Train a 14GB fp16 model across GPUs that individually have 12GB, over regular Ethernet.
 
+### New: Activation Reserve & 4-bit Compute
+
+- **`activation_reserve_mb`** — Subtracts a fixed amount from each GPU's VRAM before computing shard weights. Accounts for per-rank activation memory that doesn't shard, giving smaller GPUs proportionally more headroom.
+- **`compute_in_4bit`** — Keeps weights as `bnb.nn.Params4bit` during forward (no fp16 dequantization). Uses bitsandbytes' fused `matmul_4bit` kernel, which saves the memory cost of materializing full-precision layers.
+
 ---
 
 ## Proven Results
@@ -123,6 +128,19 @@ for batch in dataloader:
 | `ZEROQ_HETERO_RANK_WEIGHTS` | Override auto-detected VRAM weights | `24576,11520,11520` |
 | `NCCL_SOCKET_IFNAME` | Network interface for NCCL | `eno` |
 | `NCCL_BUFFSIZE` | NCCL buffer size (bytes) | `2097152` |
+
+### ZeroQConfig Options
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `quant_type` | `"nf4"` | Quantization type (`nf4` or `fp4`) |
+| `blocksize` | `64` | Elements per quantization block |
+| `double_quant` | `True` | Double quantization for absmax |
+| `compute_dtype` | `float32` | Compute dtype (`float32` for Maxwell) |
+| `async_gather` | `True` | Async all-gather operations |
+| `prefetch_count` | `1` | Layers to prefetch ahead |
+| `activation_reserve_mb` | `0.0` | MB to subtract from VRAM before shard weighting |
+| `compute_in_4bit` | `False` | Keep weights as Params4bit (no fp16 dequant) |
 
 ---
 
