@@ -61,6 +61,11 @@ class ZeroQConfig:
     # Memory settings
     pin_memory: bool = True
     contiguous_buffers: bool = True
+    activation_reserve_mb: float = 0.0  # Subtract from VRAM before computing shard weights
+    
+    # 4-bit compute: keep weights as bnb Params4bit during forward (no fp16 dequant)
+    # Requires model Linear layers to be bnb.nn.Linear4bit
+    compute_in_4bit: bool = False
     
     # Module targeting
     target_modules: Optional[List[str]] = None

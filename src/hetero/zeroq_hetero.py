@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from bitsandbytes.functional import quantize_4bit, dequantize_4bit, QuantState
+import bitsandbytes as bnb
 
 from .shard_plan import make_plan, ShardPlan
 
@@ -55,13 +56,28 @@ def _parse_rank_weights_env(world_size: int) -> list[float] | None:
     return [float(x) for x in parts]
 
 
-def discover_rank_weights(*, group: Optional[dist.ProcessGroup] = None) -> list[float]:
+def discover_rank_weights(
+    *,
+    group: Optional[dist.ProcessGroup] = None,
+    activation_reserve_mb: float = 0.0,
+) -> list[float]:
     """Auto-detect per-rank capacity weights via CUDA device properties.
 
     Preference order:
     1) ZEROQ_HETERO_RANK_WEIGHTS env var (comma-separated list)
     2) CUDA total_memory per rank (all_gather across ranks)
     3) Uniform weights (fallback)
+
+    If activation_reserve_mb > 0, that amount is subtracted from each
+    GPU's raw VRAM before computing weights. This accounts for the
+    per-rank activation memory that does NOT shard — every rank pays
+    the same activation tax, so smaller GPUs need proportionally more
+    headroom reserved.
+
+    Example without reserve:
+      [24576, 11520] → ratio 2.13:1
+    Example with 8192 MB reserve:
+      [24576-8192, 11520-8192] = [16384, 3328] → ratio 4.92:1
 
     Returns:
         List of float weights, one per rank. Larger = more shards.
@@ -91,10 +107,22 @@ def discover_rank_weights(*, group: Optional[dist.ProcessGroup] = None) -> list[
     t = torch.tensor([w], dtype=torch.float64, device=gather_device)
     out = [torch.empty_like(t) for _ in range(ws)]
     dist.all_gather(out, t, group=group)
-    weights = [float(x.item()) for x in out]
+    raw_weights = [float(x.item()) for x in out]
 
-    if not any(v > 0 for v in weights):
-        return [1.0 for _ in weights]
+    if not any(v > 0 for v in raw_weights):
+        return [1.0 for _ in raw_weights]
+
+    # Subtract activation reserve from each GPU's capacity
+    if activation_reserve_mb > 0:
+        weights = [max(w - activation_reserve_mb, 1.0) for w in raw_weights]
+        rank0 = dist.get_rank(group) if dist.is_initialized() else 0
+        if rank0 == 0:
+            print(f"[ZeRO-Q Hetero] Activation reserve: {activation_reserve_mb:.0f} MB per rank")
+            print(f"[ZeRO-Q Hetero] Raw VRAM (MB):  {[f'{w:.0f}' for w in raw_weights]}")
+            print(f"[ZeRO-Q Hetero] Adjusted weights: {[f'{w:.0f}' for w in weights]}")
+    else:
+        weights = raw_weights
+
     return weights
 
 
@@ -144,6 +172,7 @@ class HeteroZeroQParameter:
         self.original_shape = param.data.shape
         self.original_numel = param.data.numel()
         self.original_dtype = param.data.dtype
+        self.compute_in_4bit = bool(_cfg_attr(config, 'compute_in_4bit', False))
 
         self.status = HeteroZeroQParamStatus.NOT_AVAILABLE
 
@@ -445,6 +474,24 @@ class HeteroZeroQParameter:
         if self._assembled_packed.is_cuda:
             torch.cuda.empty_cache()
 
+        # ── 4-bit compute mode: keep as Params4bit, no fp16 dequant ──
+        if self.compute_in_4bit and self.module is not None and self.param_name is not None:
+            # Create a bnb Params4bit — bnb's Linear4bit.forward() will use
+            # its fused matmul_4bit kernel, never materializing an fp16 copy
+            param_4bit = bnb.nn.Params4bit(
+                self._assembled_packed.clone(),
+                requires_grad=False,
+                quant_state=gathered_state,
+                quant_type=self._quant_meta["quant_type"],
+                blocksize=self._quant_meta["blocksize"],
+            )
+            setattr(self.module, self.param_name, param_4bit)
+            self.param = param_4bit
+            self.status = HeteroZeroQParamStatus.AVAILABLE
+            self._gather_handles = None
+            return
+
+        # ── Standard mode: dequantize to fp16/fp32 ──
         restored = dequantize_4bit(self._assembled_packed, gathered_state)
 
         target_dtype = self.original_dtype
@@ -525,7 +572,11 @@ class HeteroZeroQCoordinator:
             self.rank = 0
             self.world_size = 1
 
-        self.rank_weights = discover_rank_weights(group=process_group)
+        activation_reserve = float(_cfg_attr(config, 'activation_reserve_mb', 0.0))
+        self.rank_weights = discover_rank_weights(
+            group=process_group,
+            activation_reserve_mb=activation_reserve,
+        )
 
         self._params: Dict[int, HeteroZeroQParameter] = {}
         self._params_by_obj_id: Dict[int, HeteroZeroQParameter] = {}
@@ -583,7 +634,8 @@ class HeteroZeroQCoordinator:
             p = self._params[pid]
             entries.append(f"{pid}:{tuple(p.original_shape)}:{p.original_numel}")
         fingerprint = "|".join(entries)
-        local_hash = int(hashlib.sha256(fingerprint.encode()).hexdigest()[:16], 16)
+        # Use 15 hex chars (60 bits) to stay within signed int64 range for torch.long
+        local_hash = int(hashlib.sha256(fingerprint.encode()).hexdigest()[:15], 16)
 
         # All-gather hashes from every rank
         local_tensor = torch.tensor([local_hash], dtype=torch.long,
