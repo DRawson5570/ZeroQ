@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Author:** Douglas Rawson
-**Status:** ✅ Production — Multi-node heterogeneous training validated
-**Hardware:** Tesla M40 cluster (mixed 24GB/12GB) over TCP/NCCL
+**Status:** ✅ Production — Custom 4.7B decoder transformer at 88% GPU util, 8.3× faster with 4-bit compute
+**Hardware:** Tesla M40 cluster (mixed 24GB/12GB) over TCP/NCCL, now integrated with compiled-hybrid-lm
 
 ---
 
@@ -14,28 +14,39 @@
 
 ZeRO-Q combines **ZeRO-3 parameter partitioning** with **4-bit NF4 quantization** to train large models on GPUs that individually can't hold them.
 
-The **hetero** module extends this to **mixed-VRAM clusters** — a 24GB GPU takes 2x the shard of a 12GB GPU, automatically.
+The **hetero** module extends this to **mixed-VRAM clusters** — a 24GB GPU takes 2x the shard of a 12GB GPU, automatically. The **4-bit compute** mode eliminates per-layer gather/release entirely, converting `nn.Linear` to `bnb.nn.Linear4bit` for fused `matmul_4bit` — 8× faster on SYS-topology GPUs.
 
 ```
-Standard ZeRO-3:           ZeRO-Q:
-├─ Shard FP16 weights      ├─ Quantize to 4-bit NF4
-├─ All-gather FP16         ├─ Shard packed uint8 + absmax (weighted by VRAM)
-├─ 2 bytes/param comm      ├─ All-gather 4-bit (~0.5 bytes/param)
-└─ Compute in FP16         └─ Dequantize locally → compute in FP16
+Standard ZeRO-3:           ZeRO-Q (gather/release):    ZeRO-Q (4-bit compute):
+├─ Shard FP16 weights      ├─ Quantize to 4-bit NF4    ├─ Quantize to 4-bit NF4
+├─ All-gather FP16         ├─ All-gather per layer     ├─ Gather full weights ONCE
+├─ 2 bytes/param comm      ├─ Dequantize → compute     ├─ Convert to bnb.Linear4bit
+└─ Compute in FP16         └─ Release after forward    └─ Native matmul_4bit, no hooks
 ```
 
-**Result:** Train a 14GB fp16 model across GPUs that individually have 12GB, over regular Ethernet.
-
-### New: Activation Reserve & 4-bit Compute
-
-- **`activation_reserve_mb`** — Subtracts a fixed amount from each GPU's VRAM before computing shard weights. Accounts for per-rank activation memory that doesn't shard, giving smaller GPUs proportionally more headroom.
-- **`compute_in_4bit`** — Keeps weights as `bnb.nn.Params4bit` during forward (no fp16 dequantization). Uses bitsandbytes' fused `matmul_4bit` kernel, which saves the memory cost of materializing full-precision layers.
+**Result:** Train a 4.7B-param custom transformer at 88% GPU util on 2× Tesla M40, or a 14GB fp16 model across GPUs that individually have 12GB, over regular Ethernet.
 
 ---
 
 ## Proven Results
 
-**Qwen2.5-7B-Instruct** with LoRA on 3x Tesla M40 (1×24GB + 2×12GB), two physical servers:
+### Custom 4.7B Decoder Transformer (compiled-hybrid-lm)
+
+**DeepSeekForCausalLM** (d=3072, 40 layers, explicit Q/K/V/O/FFN, GPT-2 BPE) on 2× Tesla M40 24GB:
+
+| Metric | Before (gather/release) | After (4-bit compute) |
+|--------|-------------------------|-----------------------|
+| Epoch time (50 steps) | 1,118s | **135s** |
+| Training throughput | 2.86 tok/s | **23.7 tok/s** |
+| GPU utilization | 13% | **88%** |
+| Peak VRAM per GPU | 17.7 GB (cycling) | **5.4 GB** (steady) |
+| Speedup | — | **8.3×** |
+
+With compiled priors (21-channel n-gram, topic, KV-cache, POS) + SuperpositionSteererV3 (65K params, 9 hooks).
+
+### Qwen2.5-7B-Instruct (LoRA, Hetero)
+
+On 3× Tesla M40 (1×24GB + 2×12GB), two physical servers:
 
 | Metric | Value |
 |--------|-------|
@@ -44,6 +55,16 @@ Standard ZeRO-3:           ZeRO-Q:
 | GPU utilization | 98-100% compute |
 | NCCL throughput | 300 MiB/s (TCP, Gen2 PCIe) |
 | Shard distribution | Weighted proportional to VRAM |
+
+### Projected Cluster Capacity (5× M40 24GB)
+
+| Model Size | 4-bit Weight/GPU | Feasibility |
+|------------|------------------|-------------|
+| 4.7B | 1.2 GB | ✅ Running |
+| 10B | 2.5 GB | ✅ Comfortable |
+| 20B | 5.0 GB | ✅ Fit |
+| 30B | 7.5 GB | ✅ With checkpointing |
+| 35B | 8.8 GB | ✅ Tight, activation-bound |
 
 ---
 
@@ -71,6 +92,8 @@ src/
 ### Core Concepts
 
 **Gather/Release Lifecycle:** Pre-forward hook gathers (dequantizes full param from all shards). Post-forward hook releases (drops back to local shard). Same for backward. At any moment, only ~1 layer's worth of full-precision params is materialized.
+
+**4-bit Compute Mode:** After partition, gathers full 4-bit weights once per `nn.Linear` layer, converts to `bnb.nn.Linear4bit` with `Params4bit`, then removes ZeroQ hooks entirely. Linear4bit uses bitsandbytes' fused `matmul_4bit` kernel — no per-step gather/release, no dequantization overhead. Eliminates NCCL all-gather bottleneck on SYS-topology GPUs (8.3× speedup observed).
 
 **Hetero Weighted Partitioning:** `discover_rank_weights()` auto-detects each GPU's VRAM via `torch.cuda.get_device_properties()`, then `make_plan()` computes shard lengths proportional to capacity. A 24GB card holds 2x the shard of a 12GB card.
 
@@ -148,13 +171,14 @@ for batch in dataloader:
 
 ```
 torch >= 2.0
-bitsandbytes == 0.43.2    # Critical: last version with Maxwell (SM 5.2) support
+bitsandbytes == 0.41.3    # CRITICAL: last version with Maxwell (SM 5.2) support. MUST PIN.
+triton == 3.3.1            # Required by bitsandbytes 0.41.3 nn module imports
 transformers
 peft
 safetensors
 ```
 
-> **Note:** bitsandbytes 0.48+ dropped Maxwell GPU support. Use 0.43.2 for Tesla M40 / GTX 9xx / GTX 10xx.
+> **Note:** bitsandbytes 0.46.1+ dropped Maxwell GPU support entirely. Use 0.41.3 EXACTLY for Tesla M40 / GTX 9xx / GTX 10xx. Version must be pinned — any other version will fail to import on Maxwell hardware.
 
 ---
 
