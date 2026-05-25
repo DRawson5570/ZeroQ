@@ -4,7 +4,7 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Author:** Douglas Rawson & Zero (Claude)
+**Author:** Douglas Rawson
 **Status:** ✅ Production — Multi-node heterogeneous training validated
 **Hardware:** Tesla M40 cluster (mixed 24GB/12GB) over TCP/NCCL
 
