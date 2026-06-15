@@ -186,6 +186,7 @@ class ZeroQTrainConfig(ZeroQConfig):
     training_mode: bool = True
     frozen_only: bool = False
     partition_trainable: bool = True
+    cpu_offload: bool = False
     optimizer_cls: str = "AdamW"
     optimizer_kwargs: dict = field(default_factory=lambda: {"lr": 3e-4})
 
