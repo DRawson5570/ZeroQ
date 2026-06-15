@@ -187,6 +187,12 @@ class ZeroQTrainConfig(ZeroQConfig):
     frozen_only: bool = False
     partition_trainable: bool = True
     cpu_offload: bool = False
+    master_dtype: torch.dtype = torch.float32
+    fused_shard_step: bool = False
+    lion_lr: float = 3e-4
+    lion_beta1: float = 0.9
+    lion_beta2: float = 0.99
+    lion_wd: float = 0.01
     optimizer_cls: str = "AdamW"
     optimizer_kwargs: dict = field(default_factory=lambda: {"lr": 3e-4})
 

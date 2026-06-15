@@ -227,7 +227,8 @@ class ZeroQParameter:
 
     def _partition_fp32_training(self, weight: torch.Tensor):
         """Shard weight into fp32 master shards (no quantization)."""
-        if getattr(self.config, "cpu_offload", False):
+        if getattr(self.config, "cpu_offload", False) \
+                or getattr(self.config, "fused_shard_step", False):
             self._partition_cpu_offload(weight)
             return
 
@@ -324,17 +325,22 @@ class ZeroQParameter:
             "quant_type": quant_state.quant_type,
         }
 
-        flat_fp32 = weight.detach().contiguous().view(-1).to(torch.float32)
-        chunk_size = (flat_fp32.numel() + self.world_size - 1) // self.world_size
+        mdtype = getattr(self.config, 'master_dtype', torch.float32)
+        flat = weight.detach().contiguous().view(-1).to(mdtype)
+        chunk_size = (flat.numel() + self.world_size - 1) // self.world_size
         start = self.rank * chunk_size
-        end = min(start + chunk_size, flat_fp32.numel())
-        shard = flat_fp32[start:end].clone().cpu()
+        end = min(start + chunk_size, flat.numel())
+        shard = flat[start:end].clone()
+        if getattr(self.config, 'cpu_offload', False):
+            shard = shard.cpu()
+        else:
+            shard = shard.to(gpu_dev)
         if shard.numel() < chunk_size:
             shard = F.pad(shard, (0, chunk_size - shard.numel()))
         self.master_shard = torch.nn.Parameter(shard, requires_grad=True)
         self._fp32_chunk_size = chunk_size
 
-        del weight_gpu, packed, absmax, flat_fp32
+        del weight_gpu, packed, absmax, flat
         self.param.data = torch.empty(0, device=gpu_dev, dtype=self.original_dtype)
         self.status = ZeroQParamStatus.NOT_AVAILABLE
         if gpu_dev.type == "cuda":
@@ -349,6 +355,8 @@ class ZeroQParameter:
         (which would prevent per-layer memory release).
         """
         self.param.requires_grad_(False)
+        if self.param.data.dtype != torch.float32:
+            self.param.data = self.param.data.float()
 
     def start_gather(self, group: Optional[dist.ProcessGroup] = None, async_op: bool = True):
         """
@@ -476,6 +484,8 @@ class ZeroQParameter:
             if self._fp32_gather_handle is not None:
                 self._fp32_gather_handle.wait()
             self._complete_gather_fp32()
+            if getattr(self.config, "fused_shard_step", False):
+                self._make_trainable_with_cpu_grad()
             return
 
         if self._gather_handles is not None:
@@ -584,6 +594,8 @@ class ZeroQParameter:
         """All-gather fp32 master shards across ranks."""
         if not dist.is_initialized() or self.world_size == 1:
             self._complete_gather_fp32()
+            if getattr(self.config, "fused_shard_step", False):
+                self._make_trainable_with_cpu_grad()
             return None
 
         if self._fp32_gather_buffers is None:
@@ -604,6 +616,8 @@ class ZeroQParameter:
             return handle
         else:
             self._complete_gather_fp32()
+            if getattr(self.config, "fused_shard_step", False):
+                self._make_trainable_with_cpu_grad()
             return None
 
     def _complete_gather_fp32(self):
@@ -945,7 +959,8 @@ class ZeroQModuleWrapper:
         if module in self._module_param_ids:
             param_ids = self._module_param_ids[module]
             self.coordinator.fetch_params(param_ids, async_op=False)
-            if getattr(self.coordinator.config, "cpu_offload", False):
+            if getattr(self.coordinator.config, "cpu_offload", False) \
+                    or getattr(self.coordinator.config, "fused_shard_step", False):
                 module._zq_saved_input = inputs[0].detach()
     
     def _post_forward_hook(self, module: torch.nn.Module, inputs, outputs):
@@ -963,7 +978,8 @@ class ZeroQModuleWrapper:
     def _post_backward_hook(self, module: torch.nn.Module, grad_input, grad_output):
         """Release parameters after backward pass to maintain memory savings during training."""
         if module in self._module_param_ids:
-            if getattr(self.coordinator.config, "cpu_offload", False) \
+            if (getattr(self.coordinator.config, "cpu_offload", False)
+                    or getattr(self.coordinator.config, "fused_shard_step", False)) \
                     and hasattr(module, '_zq_saved_input') \
                     and grad_output[0] is not None:
                 self._manual_weight_grad(module, grad_output[0])
@@ -976,6 +992,7 @@ class ZeroQModuleWrapper:
         inp = module._zq_saved_input
         go = grad_output.reshape(-1, grad_output.shape[-1])
         x = inp.reshape(-1, inp.shape[-1])
+        fused = getattr(self.coordinator.config, 'fused_shard_step', False)
         for param_id in self._module_param_ids[module]:
             zq = self.coordinator._params[param_id]
             if zq.master_shard is None:
@@ -991,7 +1008,33 @@ class ZeroQModuleWrapper:
                 local = reduce_scatter_grads(flat, zq.world_size, zq.rank)
             else:
                 local = flat[:zq.master_shard.numel()]
-            zq.master_shard.grad = local.to(zq.master_shard.device)
+            if fused:
+                self._fused_lion_step(zq, local)
+            else:
+                zq.master_shard.grad = local.to(zq.master_shard.device)
+
+    def _fused_lion_step(self, zq, grad_shard):
+        """Inline Lion optimizer step with stochastic rounding for fp16 masters."""
+        cfg = self.coordinator.config
+        grad = grad_shard.to(device=zq.master_shard.device, dtype=torch.float32)
+
+        if not hasattr(zq, '_lion_m'):
+            zq._lion_m = torch.zeros(zq.master_shard.numel(),
+                                     device=zq.master_shard.device,
+                                     dtype=torch.float32)
+
+        update = torch.sign(zq._lion_m * cfg.lion_beta1 + grad * (1 - cfg.lion_beta1))
+        master = zq.master_shard.data.float()
+        master -= cfg.lion_lr * (update + cfg.lion_wd * master)
+        zq._lion_m = zq._lion_m * cfg.lion_beta2 + grad * (1 - cfg.lion_beta2)
+
+        if zq.master_shard.dtype == torch.float16:
+            noise = torch.empty_like(master).uniform_(-0.5, 0.5)
+            eps = (master.abs() * torch.finfo(torch.float16).eps).clamp(
+                min=torch.finfo(torch.float16).tiny)
+            zq.master_shard.data = (master + noise * eps).half()
+        else:
+            zq.master_shard.data = master.to(zq.master_shard.dtype)
     
     def partition(self):
         """Partition all parameters."""
