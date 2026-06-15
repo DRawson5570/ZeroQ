@@ -337,29 +337,18 @@ class ZeroQParameter:
         del weight_gpu, packed, absmax, flat_fp32
         self.param.data = torch.empty(0, device=gpu_dev, dtype=self.original_dtype)
         self.status = ZeroQParamStatus.NOT_AVAILABLE
+        if gpu_dev.type == "cuda":
+            torch.cuda.empty_cache()
 
     def _make_trainable_with_cpu_grad(self):
-        """Post-process a dequantized param: set requires_grad, register CPU grad hook."""
-        restored = self.param.data
-        new_param = torch.nn.Parameter(restored, requires_grad=True)
+        """Force requires_grad=False so autograd treats weight as frozen.
 
-        zq_self = self
-        def _grad_hook(grad):
-            flat = grad.contiguous().view(-1)
-            if zq_self.world_size > 1 and reduce_scatter_grads is not None:
-                local = reduce_scatter_grads(
-                    flat, zq_self.world_size, zq_self.rank)
-            else:
-                shard_len = zq_self.master_shard.numel()
-                local = flat[:shard_len]
-            zq_self.master_shard.grad = local.to(zq_self.master_shard.device)
-        new_param.register_hook(_grad_hook)
-
-        if self.module is not None and self.param_name is not None:
-            setattr(self.module, self.param_name, new_param)
-            self.param = new_param
-        else:
-            self.param = new_param
+        Weight gradients are computed manually in _post_backward_hook
+        using saved inputs and grad_output, then sent to CPU master shards.
+        This avoids autograd holding leaf references to gathered weights
+        (which would prevent per-layer memory release).
+        """
+        self.param.requires_grad_(False)
 
     def start_gather(self, group: Optional[dist.ProcessGroup] = None, async_op: bool = True):
         """
@@ -956,6 +945,8 @@ class ZeroQModuleWrapper:
         if module in self._module_param_ids:
             param_ids = self._module_param_ids[module]
             self.coordinator.fetch_params(param_ids, async_op=False)
+            if getattr(self.coordinator.config, "cpu_offload", False):
+                module._zq_saved_input = inputs[0].detach()
     
     def _post_forward_hook(self, module: torch.nn.Module, inputs, outputs):
         """Release gathered parameters after forward to keep peak memory bounded."""
@@ -972,8 +963,32 @@ class ZeroQModuleWrapper:
     def _post_backward_hook(self, module: torch.nn.Module, grad_input, grad_output):
         """Release parameters after backward pass to maintain memory savings during training."""
         if module in self._module_param_ids:
+            if getattr(self.coordinator.config, "cpu_offload", False) \
+                    and hasattr(module, '_zq_saved_input') \
+                    and grad_output[0] is not None:
+                self._manual_weight_grad(module, grad_output[0])
+                del module._zq_saved_input
             param_ids = self._module_param_ids[module]
             self.coordinator.release_params(param_ids)
+
+    def _manual_weight_grad(self, module, grad_output):
+        """Compute weight gradient manually for nn.Linear (cpu_offload mode)."""
+        inp = module._zq_saved_input
+        go = grad_output.reshape(-1, grad_output.shape[-1])
+        x = inp.reshape(-1, inp.shape[-1])
+        for param_id in self._module_param_ids[module]:
+            zq = self.coordinator._params[param_id]
+            if zq.master_shard is None:
+                continue
+            if zq.param_name == 'weight':
+                wg = go.T @ x
+                flat = wg.contiguous().view(-1)
+            elif zq.param_name == 'bias':
+                flat = go.sum(0).contiguous().view(-1)
+            else:
+                continue
+            shard_len = zq.master_shard.numel()
+            zq.master_shard.grad = flat[:shard_len].to(zq.master_shard.device)
     
     def partition(self):
         """Partition all parameters."""
