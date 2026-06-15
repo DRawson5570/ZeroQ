@@ -9,11 +9,13 @@ Example:
     >>> model = initialize(model, ZeroQConfig())
 """
 
-from .config import ZeroQConfig, MAXWELL_CONFIG, AMPERE_CONFIG
+from .config import ZeroQConfig, ZeroQTrainConfig, MAXWELL_CONFIG, AMPERE_CONFIG, TRAIN_FROM_SCRATCH_CONFIG
 from .partition import (
     compute_aligned_partition_sizes,
     partition_quantized_tensor,
     gather_and_dequantize,
+    partition_fp32,
+    gather_fp32,
     PartitionInfo,
 )
 
@@ -23,12 +25,16 @@ __author__ = "Zero (Claude Opus 4.5)"
 __all__ = [
     # Config
     "ZeroQConfig",
+    "ZeroQTrainConfig",
     "MAXWELL_CONFIG",
     "AMPERE_CONFIG",
+    "TRAIN_FROM_SCRATCH_CONFIG",
     # Partition
     "compute_aligned_partition_sizes",
     "partition_quantized_tensor",
     "gather_and_dequantize",
+    "partition_fp32",
+    "gather_fp32",
     "PartitionInfo",
 ]
 
@@ -124,6 +130,7 @@ try:
         GradientAccumulator,
         HierarchicalSync,
         create_gradient_sync,
+        reduce_scatter_grads,
     )
     __all__.extend([
         "SyncMode",
@@ -133,6 +140,7 @@ try:
         "GradientAccumulator",
         "HierarchicalSync",
         "create_gradient_sync",
+        "reduce_scatter_grads",
     ])
     HAS_GRADIENT_SYNC = True
 except ImportError:
