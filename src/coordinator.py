@@ -987,8 +987,11 @@ class ZeroQModuleWrapper:
                 flat = go.sum(0).contiguous().view(-1)
             else:
                 continue
-            shard_len = zq.master_shard.numel()
-            zq.master_shard.grad = flat[:shard_len].to(zq.master_shard.device)
+            if zq.world_size > 1 and reduce_scatter_grads is not None:
+                local = reduce_scatter_grads(flat, zq.world_size, zq.rank)
+            else:
+                local = flat[:zq.master_shard.numel()]
+            zq.master_shard.grad = local.to(zq.master_shard.device)
     
     def partition(self):
         """Partition all parameters."""
