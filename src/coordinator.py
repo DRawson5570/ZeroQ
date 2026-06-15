@@ -810,16 +810,12 @@ class ZeroQModuleWrapper:
     def _post_forward_hook(self, module: torch.nn.Module, inputs, outputs):
         """Release gathered parameters after forward to keep peak memory bounded."""
         if module in self._module_param_ids:
-            if getattr(self.coordinator.config, "training_mode", False):
-                return
             param_ids = self._module_param_ids[module]
             self.coordinator.release_params(param_ids)
 
     def _pre_backward_hook(self, module: torch.nn.Module, grad_output):
         """Re-gather parameters right before backward for this module."""
         if module in self._module_param_ids:
-            if getattr(self.coordinator.config, "training_mode", False):
-                return
             param_ids = self._module_param_ids[module]
             self.coordinator.fetch_params(param_ids, async_op=False)
 
