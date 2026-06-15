@@ -227,6 +227,10 @@ class ZeroQParameter:
 
     def _partition_fp32_training(self, weight: torch.Tensor):
         """Shard weight into fp32 master shards (no quantization)."""
+        if getattr(self.config, "cpu_offload", False):
+            self._partition_cpu_offload(weight)
+            return
+
         target_device = self.param.device
         if target_device.type != "cuda" and torch.cuda.is_available():
             target_device = torch.device("cuda")
@@ -257,6 +261,106 @@ class ZeroQParameter:
         self.param.data = torch.empty(0, device=target_device, dtype=torch.float32)
         self.status = ZeroQParamStatus.NOT_AVAILABLE
 
+    def _partition_cpu_offload(self, weight: torch.Tensor):
+        """Hybrid partition: 4-bit shard on GPU (cache) + fp32 master on CPU."""
+        gpu_dev = torch.device("cuda") if torch.cuda.is_available() else self.param.device
+
+        if self.param.device.type == "meta" or self.param.device != gpu_dev:
+            if self.module is None or self.param_name is None:
+                raise RuntimeError(
+                    "ZeroQParameter needs module+param_name to replace meta/cpu params."
+                )
+            new_param = torch.nn.Parameter(
+                torch.empty(0, device=gpu_dev, dtype=self.original_dtype),
+                requires_grad=True,
+            )
+            setattr(self.module, self.param_name, new_param)
+            self.param = new_param
+
+        weight_gpu = weight.contiguous().to(device=gpu_dev)
+        if weight_gpu.dtype != torch.float16:
+            weight_gpu = weight_gpu.to(torch.float16)
+
+        if gpu_dev.type == "cuda":
+            torch.cuda.synchronize()
+
+        packed, quant_state = quantize_4bit(
+            weight_gpu,
+            blocksize=self.config.blocksize,
+            quant_type=self.config.quant_type,
+        )
+
+        packed = packed.contiguous().view(-1)
+        absmax = quant_state.absmax.contiguous().view(-1)
+
+        packed_size = packed.numel()
+        absmax_size = absmax.numel()
+        self._packed_total = packed_size
+        self._absmax_total = absmax_size
+
+        self.packed_per_rank = packed_size // self.world_size
+        self.absmax_per_rank = absmax_size // self.world_size
+        self._packed_remainder = packed_size % self.world_size
+        self._absmax_remainder = absmax_size % self.world_size
+
+        packed_start = self.rank * self.packed_per_rank
+        packed_end = packed_start + self.packed_per_rank
+        if self.rank == self.world_size - 1:
+            packed_end += self._packed_remainder
+
+        absmax_start = self.rank * self.absmax_per_rank
+        absmax_end = absmax_start + self.absmax_per_rank
+        if self.rank == self.world_size - 1:
+            absmax_end += self._absmax_remainder
+
+        self.local_packed = packed[packed_start:packed_end].clone()
+        self.local_absmax = absmax[absmax_start:absmax_end].clone()
+
+        self._quant_meta = {
+            "shape": quant_state.shape,
+            "dtype": quant_state.dtype,
+            "blocksize": quant_state.blocksize,
+            "code": quant_state.code,
+            "quant_type": quant_state.quant_type,
+        }
+
+        flat_fp32 = weight.detach().contiguous().view(-1).to(torch.float32)
+        chunk_size = (flat_fp32.numel() + self.world_size - 1) // self.world_size
+        start = self.rank * chunk_size
+        end = min(start + chunk_size, flat_fp32.numel())
+        shard = flat_fp32[start:end].clone().cpu()
+        if shard.numel() < chunk_size:
+            shard = F.pad(shard, (0, chunk_size - shard.numel()))
+        self.master_shard = torch.nn.Parameter(shard, requires_grad=True)
+        self._fp32_chunk_size = chunk_size
+
+        del weight_gpu, packed, absmax, flat_fp32
+        self.param.data = torch.empty(0, device=gpu_dev, dtype=self.original_dtype)
+        self.status = ZeroQParamStatus.NOT_AVAILABLE
+
+    def _make_trainable_with_cpu_grad(self):
+        """Post-process a dequantized param: set requires_grad, register CPU grad hook."""
+        restored = self.param.data
+        new_param = torch.nn.Parameter(restored, requires_grad=True)
+
+        zq_self = self
+        def _grad_hook(grad):
+            flat = grad.contiguous().view(-1)
+            if zq_self.world_size > 1 and reduce_scatter_grads is not None:
+                local = reduce_scatter_grads(
+                    flat, zq_self.world_size, zq_self.rank)
+            else:
+                shard_len = zq_self.master_shard.numel()
+                local = flat[:shard_len]
+            zq_self.master_shard.grad = local.to(zq_self.master_shard.device)
+        new_param.register_hook(_grad_hook)
+
+        if self.module is not None and self.param_name is not None:
+            setattr(self.module, self.param_name, new_param)
+            self.param = new_param
+        else:
+            self.param = new_param
+
     def start_gather(self, group: Optional[dist.ProcessGroup] = None, async_op: bool = True):
         """
         Start async all-gather of quantized partitions.
@@ -274,7 +378,8 @@ class ZeroQParameter:
         if self.status == ZeroQParamStatus.INFLIGHT:
             return self._gather_handles
 
-        if getattr(self.config, "training_mode", False):
+        if getattr(self.config, "training_mode", False) \
+                and not getattr(self.config, "cpu_offload", False):
             return self._start_gather_fp32(group, async_op)
 
         # Prefer contiguous gather to reduce allocator fragmentation and peak memory.
@@ -366,16 +471,19 @@ class ZeroQParameter:
             self.status = ZeroQParamStatus.INFLIGHT
             return self._gather_handles
         else:
-            # Synchronous - complete immediately
             self._complete_gather()
+            if getattr(self.config, "cpu_offload", False) \
+                    and getattr(self.config, "training_mode", False):
+                self._make_trainable_with_cpu_grad()
             return None
-    
+
     def wait_gather(self):
         """Wait for async gather to complete."""
         if self.status != ZeroQParamStatus.INFLIGHT:
             return
 
-        if getattr(self.config, "training_mode", False):
+        if getattr(self.config, "training_mode", False) \
+                and not getattr(self.config, "cpu_offload", False):
             if self._fp32_gather_handle is not None:
                 self._fp32_gather_handle.wait()
             self._complete_gather_fp32()
@@ -386,7 +494,11 @@ class ZeroQParameter:
             self._gather_handles[1].wait()
 
         self._complete_gather()
-    
+
+        if getattr(self.config, "cpu_offload", False) \
+                and getattr(self.config, "training_mode", False):
+            self._make_trainable_with_cpu_grad()
+
     def _complete_gather(self):
         """Complete the gather operation and dequantize."""
         # Concatenate gathered data (prefer contiguous gather buffers if available).
@@ -540,7 +652,8 @@ class ZeroQParameter:
         if self.status == ZeroQParamStatus.NOT_AVAILABLE:
             return
 
-        if getattr(self.config, "training_mode", False):
+        if getattr(self.config, "training_mode", False) \
+                and not getattr(self.config, "cpu_offload", False):
             self._release_fp32()
             return
 
@@ -711,6 +824,42 @@ class ZeroQCoordinator:
         """Return master-shard parameters for optimizer construction (training mode)."""
         return [p.master_shard for p in self._params.values() if p.master_shard is not None]
 
+    def update_4bit_from_masters(self):
+        """Re-quantize CPU master shards to GPU 4-bit after optimizer step.
+
+        Only meaningful when cpu_offload=True.  Each master shard is moved to
+        GPU, re-quantized via quantize_4bit, and the local packed/absmax
+        shards are updated in-place.
+        """
+        for zq in self._params.values():
+            if zq.master_shard is None or zq.local_packed is None:
+                continue
+            weight_gpu = zq.master_shard.data.to(
+                device=zq.local_packed.device, dtype=torch.float16,
+            )
+            packed, qs = quantize_4bit(
+                weight_gpu,
+                blocksize=zq.config.blocksize,
+                quant_type=zq.config.quant_type,
+            )
+            packed = packed.contiguous().view(-1)
+            absmax = qs.absmax.contiguous().view(-1)
+
+            p_start = zq.rank * zq.packed_per_rank
+            p_end = p_start + zq.packed_per_rank
+            if zq.rank == zq.world_size - 1:
+                p_end += zq._packed_remainder
+
+            a_start = zq.rank * zq.absmax_per_rank
+            a_end = a_start + zq.absmax_per_rank
+            if zq.rank == zq.world_size - 1:
+                a_end += zq._absmax_remainder
+
+            zq.local_packed.copy_(packed[p_start:p_end])
+            zq.local_absmax.copy_(absmax[a_start:a_end])
+            del weight_gpu, packed, absmax, qs
+        torch.cuda.empty_cache()
+
     def gather_full_state_dict(self) -> Dict[str, torch.Tensor]:
         """Gather all shards and return a full-model state dict.
 
@@ -761,15 +910,16 @@ class ZeroQModuleWrapper:
     
     def _register_parameters(self, module: torch.nn.Module):
         """Register all parameters in module tree."""
+        excluded = set(self.coordinator.config.exclude_modules)
         for name, child in module.named_modules():
+            if any(ex in name for ex in excluded):
+                continue
+
             param_ids = []
             for param_name, param in child.named_parameters(recurse=False):
-                # Respect wrapper-level filter
                 if self.trainable_only and not param.requires_grad:
                     continue
 
-                # Respect config-level partitioning rules
-                # Default behavior for QLoRA: partition/freeze base weights only.
                 if param.requires_grad and not self.coordinator.config.partition_trainable:
                     continue
                 if self.coordinator.config.frozen_only and param.requires_grad:
