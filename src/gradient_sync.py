@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, List, Callable, Any, Union
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 try:
@@ -485,6 +486,52 @@ def create_gradient_sync(
         raise ValueError(f"Unknown mode: {mode}")
 
 
+def reduce_scatter_grads(
+    param_full_grad: torch.Tensor,
+    world_size: int,
+    rank: int,
+    group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    Reduce-scatter a full gradient so each rank gets its averaged shard.
+
+    Used in ZeRO-Q training-from-scratch mode: after ``loss.backward()``
+    produces a full-sized gradient, this function reduces across ranks and
+    returns only the local shard (matching the fp32 master weight shard).
+
+    If NCCL ``reduce_scatter`` is unavailable (e.g. Maxwell SM 5.2), falls
+    back to ``all_reduce`` + local slice.
+
+    Args:
+        param_full_grad: Full gradient tensor (same shape as the gathered param).
+        world_size: Number of ranks.
+        rank: This rank's index.
+        group: Process group (``None`` = default).
+
+    Returns:
+        Local gradient shard of size ``chunk_size``, averaged across ranks.
+    """
+    if not dist.is_initialized() or world_size == 1:
+        return param_full_grad.contiguous().view(-1).clone()
+
+    flat = param_full_grad.contiguous().view(-1)
+    chunk_size = (flat.numel() + world_size - 1) // world_size
+
+    if flat.numel() % world_size != 0:
+        flat = F.pad(flat, (0, chunk_size * world_size - flat.numel()))
+
+    output = torch.empty(chunk_size, device=flat.device, dtype=flat.dtype)
+
+    try:
+        dist.reduce_scatter_tensor(output, flat, op=dist.ReduceOp.SUM, group=group)
+    except (RuntimeError, AttributeError):
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+        output.copy_(flat[rank * chunk_size : (rank + 1) * chunk_size])
+
+    output.div_(world_size)
+    return output
+
+
 # Convenience exports
 __all__ = [
     "SyncMode",
@@ -494,4 +541,5 @@ __all__ = [
     "GradientAccumulator",
     "HierarchicalSync",
     "create_gradient_sync",
+    "reduce_scatter_grads",
 ]

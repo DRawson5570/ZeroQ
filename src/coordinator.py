@@ -9,14 +9,22 @@ with 4-bit quantized weights.
 from enum import Enum
 from typing import Optional, Dict, List, Tuple, Any
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from bitsandbytes.functional import quantize_4bit, dequantize_4bit, QuantState
 
-# Handle both relative and absolute imports
 try:
     from .config import ZeroQConfig
 except ImportError:
     from config import ZeroQConfig
+
+try:
+    from .gradient_sync import reduce_scatter_grads
+except ImportError:
+    try:
+        from gradient_sync import reduce_scatter_grads
+    except ImportError:
+        reduce_scatter_grads = None
 
 
 class ZeroQParamStatus(Enum):
@@ -90,13 +98,20 @@ class ZeroQParameter:
         self._send_absmax: Optional[torch.Tensor] = None
         self._assembled_packed: Optional[torch.Tensor] = None
         self._assembled_absmax: Optional[torch.Tensor] = None
+
+        # Training-from-scratch mode: fp32 master shard (no quantization)
+        self.master_shard: Optional[torch.nn.Parameter] = None
+        self._fp32_chunk_size: int = 0
+        self._fp32_gather_buffers: Optional[List[torch.Tensor]] = None
+        self._fp32_gather_handle: Optional[Any] = None
     
     def partition(self):
         """Quantize and partition the parameter."""
-        if self.status != ZeroQParamStatus.NOT_AVAILABLE or self.local_packed is not None:
+        if self.status != ZeroQParamStatus.NOT_AVAILABLE:
+            return
+        if self.local_packed is not None or self.master_shard is not None:
             return  # Already partitioned
 
-        # Default path: partition from the parameter's current full-precision data.
         self.partition_from_full_precision(self.param.data)
 
 
@@ -112,7 +127,13 @@ class ZeroQParameter:
                 to the parameter's device (CUDA recommended).
         """
 
-        if self.status != ZeroQParamStatus.NOT_AVAILABLE or self.local_packed is not None:
+        if self.status != ZeroQParamStatus.NOT_AVAILABLE:
+            return
+        if self.local_packed is not None or self.master_shard is not None:
+            return
+
+        if getattr(self.config, "training_mode", False):
+            self._partition_fp32_training(weight)
             return
 
         if weight.numel() != self.original_numel:
@@ -203,7 +224,39 @@ class ZeroQParameter:
         self.param.data = torch.empty(0, device=target_device, dtype=self.original_dtype)
         
         self.status = ZeroQParamStatus.NOT_AVAILABLE
-    
+
+    def _partition_fp32_training(self, weight: torch.Tensor):
+        """Shard weight into fp32 master shards (no quantization)."""
+        target_device = self.param.device
+        if target_device.type != "cuda" and torch.cuda.is_available():
+            target_device = torch.device("cuda")
+
+        if self.param.device.type == "meta" or self.param.device != target_device:
+            if self.module is None or self.param_name is None:
+                raise RuntimeError(
+                    "ZeroQParameter needs module+param_name to replace meta/cpu parameters."
+                )
+            new_param = torch.nn.Parameter(
+                torch.empty(0, device=target_device, dtype=torch.float32),
+                requires_grad=True,
+            )
+            setattr(self.module, self.param_name, new_param)
+            self.param = new_param
+
+        flat = weight.detach().contiguous().view(-1).to(dtype=torch.float32, device=target_device)
+        chunk_size = (flat.numel() + self.world_size - 1) // self.world_size
+        start = self.rank * chunk_size
+        end = min(start + chunk_size, flat.numel())
+        shard = flat[start:end].clone()
+        if shard.numel() < chunk_size:
+            shard = F.pad(shard, (0, chunk_size - shard.numel()))
+
+        self.master_shard = torch.nn.Parameter(shard, requires_grad=True)
+        self._fp32_chunk_size = chunk_size
+
+        self.param.data = torch.empty(0, device=target_device, dtype=torch.float32)
+        self.status = ZeroQParamStatus.NOT_AVAILABLE
+
     def start_gather(self, group: Optional[dist.ProcessGroup] = None, async_op: bool = True):
         """
         Start async all-gather of quantized partitions.
@@ -219,9 +272,11 @@ class ZeroQParameter:
             return None
         
         if self.status == ZeroQParamStatus.INFLIGHT:
-            # Already gathering, return existing handles
             return self._gather_handles
-        
+
+        if getattr(self.config, "training_mode", False):
+            return self._start_gather_fp32(group, async_op)
+
         # Prefer contiguous gather to reduce allocator fragmentation and peak memory.
         use_into_tensor = hasattr(dist, "all_gather_into_tensor") and self.world_size > 1
         if use_into_tensor:
@@ -319,11 +374,17 @@ class ZeroQParameter:
         """Wait for async gather to complete."""
         if self.status != ZeroQParamStatus.INFLIGHT:
             return
-        
+
+        if getattr(self.config, "training_mode", False):
+            if self._fp32_gather_handle is not None:
+                self._fp32_gather_handle.wait()
+            self._complete_gather_fp32()
+            return
+
         if self._gather_handles is not None:
             self._gather_handles[0].wait()
             self._gather_handles[1].wait()
-        
+
         self._complete_gather()
     
     def _complete_gather(self):
@@ -417,14 +478,72 @@ class ZeroQParameter:
         self._assembled_absmax = None
         self.status = ZeroQParamStatus.AVAILABLE
         self._gather_handles = None
-    
+
+    def _start_gather_fp32(self, group, async_op):
+        """All-gather fp32 master shards across ranks."""
+        if not dist.is_initialized() or self.world_size == 1:
+            self._complete_gather_fp32()
+            return None
+
+        if self._fp32_gather_buffers is None:
+            self._fp32_gather_buffers = [
+                torch.empty_like(self.master_shard.data) for _ in range(self.world_size)
+            ]
+
+        handle = dist.all_gather(
+            self._fp32_gather_buffers,
+            self.master_shard.data,
+            group=group,
+            async_op=async_op,
+        )
+
+        if async_op:
+            self._fp32_gather_handle = handle
+            self.status = ZeroQParamStatus.INFLIGHT
+            return handle
+        else:
+            self._complete_gather_fp32()
+            return None
+
+    def _complete_gather_fp32(self):
+        """Concatenate gathered fp32 shards and set on module."""
+        if self._fp32_gather_buffers is not None:
+            full = torch.cat(self._fp32_gather_buffers)[:self.original_numel]
+        else:
+            full = self.master_shard.data[:self.original_numel]
+
+        full = full.view(self.original_shape)
+
+        new_param = torch.nn.Parameter(full, requires_grad=True)
+
+        if self.master_shard is not None and reduce_scatter_grads is not None:
+            zq_self = self
+            def _grad_hook(grad):
+                local_grad = reduce_scatter_grads(
+                    grad, zq_self.world_size, zq_self.rank, group=None,
+                )
+                zq_self.master_shard.grad = local_grad
+            new_param.register_hook(_grad_hook)
+
+        if self.module is not None and self.param_name is not None:
+            setattr(self.module, self.param_name, new_param)
+            self.param = new_param
+        else:
+            self.param = new_param
+
+        self._fp32_gather_buffers = None
+        self._fp32_gather_handle = None
+        self.status = ZeroQParamStatus.AVAILABLE
+
     def release(self):
         """Release full parameter, keeping only local partition."""
         if self.status == ZeroQParamStatus.NOT_AVAILABLE:
             return
 
-        # Clear the full parameter. Prefer replacing the live module Parameter to
-        # avoid checkpoint metadata mismatches.
+        if getattr(self.config, "training_mode", False):
+            self._release_fp32()
+            return
+
         if self.module is not None and self.param_name is not None:
             placeholder = torch.nn.Parameter(
                 torch.empty(0, device=self.param.device, dtype=self.original_dtype),
@@ -434,7 +553,6 @@ class ZeroQParameter:
             self.param = placeholder
         else:
             self.param.data = torch.empty(0, device=self.param.device, dtype=self.original_dtype)
-        # Free gather buffers to reduce peak memory.
         self._packed_buffers = None
         self._absmax_buffers = None
         self._gathered_packed = None
@@ -444,10 +562,27 @@ class ZeroQParameter:
         self._assembled_packed = None
         self._assembled_absmax = None
         self.status = ZeroQParamStatus.NOT_AVAILABLE
+
+    def _release_fp32(self):
+        """Release gathered param in training mode (master shard stays)."""
+        device = self.master_shard.device
+        if self.module is not None and self.param_name is not None:
+            placeholder = torch.nn.Parameter(
+                torch.empty(0, device=device, dtype=torch.float32),
+                requires_grad=True,
+            )
+            setattr(self.module, self.param_name, placeholder)
+            self.param = placeholder
+        else:
+            self.param.data = torch.empty(0, device=device, dtype=torch.float32)
+        self._fp32_gather_buffers = None
+        self.status = ZeroQParamStatus.NOT_AVAILABLE
     
     @property
     def local_memory_bytes(self) -> int:
         """Memory used by local partition."""
+        if self.master_shard is not None:
+            return self.master_shard.numel() * self.master_shard.element_size()
         if self.local_packed is None:
             return 0
         return (
@@ -572,6 +707,27 @@ class ZeroQCoordinator:
             "num_params": len(self._params),
         }
     
+    def trainable_master_params(self) -> List[torch.nn.Parameter]:
+        """Return master-shard parameters for optimizer construction (training mode)."""
+        return [p.master_shard for p in self._params.values() if p.master_shard is not None]
+
+    def gather_full_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Gather all shards and return a full-model state dict.
+
+        Only meaningful on rank 0 — other ranks return an empty dict.
+        Uses the same all-gather path as the forward hook.
+        """
+        state = {}
+        for zq_param in self._params.values():
+            if zq_param.master_shard is None:
+                continue
+            zq_param.start_gather(group=self.process_group, async_op=False)
+            if self.rank == 0:
+                key = f"{id(zq_param.module)}.{zq_param.param_name}"
+                state[key] = zq_param.param.data.clone()
+            zq_param.release()
+        return state
+
     def __len__(self):
         return len(self._params)
 
@@ -654,12 +810,16 @@ class ZeroQModuleWrapper:
     def _post_forward_hook(self, module: torch.nn.Module, inputs, outputs):
         """Release gathered parameters after forward to keep peak memory bounded."""
         if module in self._module_param_ids:
+            if getattr(self.coordinator.config, "training_mode", False):
+                return
             param_ids = self._module_param_ids[module]
             self.coordinator.release_params(param_ids)
 
     def _pre_backward_hook(self, module: torch.nn.Module, grad_output):
         """Re-gather parameters right before backward for this module."""
         if module in self._module_param_ids:
+            if getattr(self.coordinator.config, "training_mode", False):
+                return
             param_ids = self._module_param_ids[module]
             self.coordinator.fetch_params(param_ids, async_op=False)
 

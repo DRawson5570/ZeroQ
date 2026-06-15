@@ -67,6 +67,10 @@ class ZeroQConfig:
     # Requires model Linear layers to be bnb.nn.Linear4bit
     compute_in_4bit: bool = False
     
+    # Training-from-scratch: shard all params as fp32 (no quantization)
+    training_mode: bool = False
+    compress_between_steps: bool = False
+    
     # Module targeting
     target_modules: Optional[List[str]] = None
     exclude_modules: List[str] = field(default_factory=lambda: ["lm_head"])
@@ -163,6 +167,38 @@ CONSUMER_CONFIG = ZeroQConfig(
     double_quant=True,
     blocksize=64,
     async_gather=True,
+)
+
+
+@dataclass
+class ZeroQTrainConfig(ZeroQConfig):
+    """
+    Configuration for training from scratch with ZeRO-Q fp32 sharding.
+
+    All parameters are sharded across GPUs as fp32 master weights (no
+    quantization).  Gradients are reduce-scattered so each rank updates
+    only its local shard.
+
+    Set ``compress_between_steps=True`` to NF4-compress master shards
+    between optimizer steps (saves ~3.5x weight memory, adds quant noise).
+    """
+
+    training_mode: bool = True
+    frozen_only: bool = False
+    partition_trainable: bool = True
+    optimizer_cls: str = "AdamW"
+    optimizer_kwargs: dict = field(default_factory=lambda: {"lr": 3e-4})
+
+    def __post_init__(self):
+        if self.compress_between_steps:
+            super().__post_init__()
+
+
+TRAIN_FROM_SCRATCH_CONFIG = ZeroQTrainConfig(
+    compute_dtype=torch.float32,
+    training_mode=True,
+    frozen_only=False,
+    partition_trainable=True,
 )
 
 

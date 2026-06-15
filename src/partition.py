@@ -10,6 +10,7 @@ Core partitioning logic for quantized tensors. Handles:
 from dataclasses import dataclass
 from typing import Tuple, Optional, TYPE_CHECKING
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 # Conditional import for bitsandbytes
@@ -448,3 +449,65 @@ def estimate_memory_savings(
         "memory_reduction": zero3_per_gpu / zeroq_per_gpu if zeroq_per_gpu > 0 else 0,
         "communication_reduction": 2.0 / 0.53,  # FP16 vs 4-bit+absmax
     }
+
+
+def partition_fp32(
+    tensor: torch.Tensor,
+    world_size: int,
+    rank: int,
+) -> Tuple[torch.Tensor, torch.Size]:
+    """
+    Shard an fp32 tensor evenly across ranks. No quantization.
+
+    Each rank receives a contiguous slice of the flattened tensor.
+    The last rank's slice is zero-padded to match the chunk size of
+    other ranks so that ``all_gather`` works with uniform tensor sizes.
+
+    Args:
+        tensor: Full weight tensor (any dtype — will be cast to float32).
+        world_size: Number of GPUs / ranks.
+        rank: This process's rank (0-indexed).
+
+    Returns:
+        local_shard: This rank's fp32 shard (shape ``[chunk_size]``).
+        original_shape: Shape of the original tensor (for reconstruction).
+    """
+    flat = tensor.detach().contiguous().view(-1).to(torch.float32)
+    chunk_size = (flat.numel() + world_size - 1) // world_size
+    start = rank * chunk_size
+    end = min(start + chunk_size, flat.numel())
+    shard = flat[start:end].clone()
+    if shard.numel() < chunk_size:
+        shard = F.pad(shard, (0, chunk_size - shard.numel()))
+    return shard, tensor.shape
+
+
+def gather_fp32(
+    local_shard: torch.Tensor,
+    original_shape: torch.Size,
+    world_size: int,
+    group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    All-gather fp32 shards and reconstruct the full tensor.
+
+    Args:
+        local_shard: This rank's fp32 shard (from ``partition_fp32``).
+        original_shape: Original tensor shape (for reshape + trim).
+        world_size: Number of GPUs / ranks.
+        group: ``torch.distributed`` process group (``None`` = default).
+
+    Returns:
+        Full fp32 tensor with ``original_shape``.
+    """
+    original_numel = 1
+    for s in original_shape:
+        original_numel *= s
+
+    if not dist.is_initialized() or world_size == 1:
+        return local_shard[:original_numel].view(original_shape)
+
+    gathered = [torch.empty_like(local_shard) for _ in range(world_size)]
+    dist.all_gather(gathered, local_shard, group=group)
+    full = torch.cat(gathered)[:original_numel]
+    return full.view(original_shape)
