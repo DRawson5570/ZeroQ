@@ -157,6 +157,78 @@ for batch in dataloader:
 
 ---
 
+## Quick Start: Training From Scratch (steered_trainer.py)
+
+The `--backend zeroq-train` mode trains ALL parameters from random init using ZeRO-3 sharding + fused Lion optimizer:
+
+```bash
+# Single GPU — fp32 masters on CPU, 4-bit cache on GPU
+python steered_trainer.py \
+  --variant baseline --d_model 1024 --n_layers 60 --d_ff 4200 --n_heads 16 \
+  --gpu 0 --gpu_ids 0 --backend zeroq-train --fused-lion \
+  --batch 4 --seq_len 256 --gradient-checkpointing \
+  --window 64 --use_rope \
+  --dataset c4 --data_dir /mnt/models/c4_tokenized \
+  --ckpt_dir ~/my_model --force-best --no-tb \
+  --lr 3e-4 --steer-lr 1e-3 \
+  --priors-dir ~/compiled_priors/compiled_priors_v3
+```
+
+```bash
+# Multi-GPU (DDP) — fp32 master shards across all GPUs
+python steered_trainer.py \
+  --variant baseline --d_model 1024 --n_layers 60 --d_ff 4200 --n_heads 16 \
+  --gpu_ids 0,1,2,3,4 --backend zeroq-train --fused-lion \
+  --batch 4 --seq_len 256 --gradient-checkpointing \
+  --window 64 --use_rope \
+  --dataset c4 --data_dir /mnt/models/c4_tokenized \
+  --ckpt_dir ~/my_model --force-best --no-tb \
+  --lr 3e-4 --steer-lr 1e-3
+```
+
+### Concurrent A/B Testing (Independent GPUs)
+
+Run baseline and steered arms simultaneously on separate GPUs:
+
+```bash
+# Terminal 1 — Steered (GPU 0)
+python steered_trainer.py ... --gpu 0 --gpu_ids 0 --backend zeroq-train --fused-lion \
+  --steer-lr 1e-3 --inject-layers 5,21,28,35,53
+
+# Terminal 2 — Baseline (GPU 1)
+python steered_trainer.py ... --gpu 1 --gpu_ids 1 --backend zeroq-train --fused-lion \
+  --no-steerer
+```
+
+### Key Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--backend zeroq-train` | Full from-scratch training (all params trainable) |
+| `--backend zeroq` | Frozen backbone + trainable surface only (~6% of params) |
+| `--fused-lion` | Per-layer Lion with fp16 masters + stochastic rounding |
+| `--priors-dir` | Path to compiled priors (`word_topics.pt`, etc.) |
+| `--inject-layers` | Override auto-computed steerer injection layers |
+| `--no-grad-flow-audit` | Skip first-step parameter audit (faster launch) |
+
+### VRAM Footprint
+
+| Model | Mode | VRAM/GPU |
+|-------|------|----------|
+| 820M | zeroq-train + fused-lion, single GPU | ~9 GB |
+| 820M | zeroq (frozen backbone), single GPU | ~2 GB |
+| 5.25B | zeroq-train + fused-lion, 5× M40 24GB | ~18 GB |
+| 7B | zeroq-train + fused-lion, cpu_offload | ~8 GB GPU + 56 GB CPU |
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Prevent allocator fragmentation OOM on M40 |
+| `TORCH_CUDA_ARCH_LIST=5.2` | Skip JIT compilation for Maxwell GPUs |
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Example |

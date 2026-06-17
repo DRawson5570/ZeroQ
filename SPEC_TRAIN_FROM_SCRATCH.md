@@ -312,6 +312,98 @@ python steered_trainer.py \
 | Gradient accumulation needed for large effective batch | Standard: accumulate N micro-batches, then reduce_scatter once |
 | Checkpoint too large (all shards gathered to rank 0) | Stream-save: rank 0 gathers one param group at a time |
 | 4-bit inter-step compression adds quantization noise | OFF by default. Only enable with `--compress-between-steps` when VRAM-constrained |
+| NCCL device collision on concurrent single-GPU runs | `_ensure_single_rank_pg` now calls `torch.cuda.set_device(device)` before NCCL init (§8.3) |
+| OOM from allocator fragmentation on M40 (12GB) | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (§8.4) |
+
+### 8.1 Fused Per-Layer Lion Optimizer
+
+**Added 2026-06-15. Gate 0 (bnb Lion8bit on Maxwell SM 5.2) and Gate 1 (loss 1.04→0.80) verified PASS.**
+
+The `--fused-lion` flag replaces AdamW with a per-layer fused Lion optimizer:
+
+```python
+config = ZeroQTrainConfig(
+    master_dtype=torch.float16,      # fp16 master shards
+    fused_shard_step=True,            # inline Lion step in _post_backward_hook
+    lion_lr=args.lr,                  # Lion learning rate
+    ...
+)
+```
+
+Key behaviors:
+- **fp16 master shards** with stochastic rounding (SR) — halves optimizer memory vs fp32
+- **Inline step**: Lion update happens immediately after gradient reduce_scatter in the `_post_backward_hook`, before the layer is released — eliminates a separate optimizer loop
+- **Excluded params** (tok_emb, pos_emb, norms, ln_f) stay fp32 with external AdamW optimizer — they're tiny and weight-tied, so the memory cost is negligible
+
+Lion requires only 1 momentum state (vs Adam's 2), halving optimizer VRAM when combined with fp16 masters. Tested on M40 SM 5.2 with bitsandbytes 0.41.3 Lion8bit — passes Gate 0 (runs at all) and Gate 1 (loss 1.04→0.80 in first few steps).
+
+### 8.2 Single-GPU Mode with CPU Offload
+
+**Added 2026-06-15. Enables 5.25B training on a single RTX 3080 10GB.**
+
+The `prepare_zeroq_train` function auto-detects single-GPU vs multi-GPU:
+
+```python
+cpu_offload = not _dist.is_initialized() or _dist.get_world_size() == 1
+```
+
+On single GPU:
+- **4-bit weights cached on GPU** for forward passes
+- **fp32 master weights + optimizer state on CPU** — avoids blowing VRAM
+- **Per-layer gather/release** keeps only one layer materialised at a time
+- **Fused Lion disabled**: master shards are on CPU, so inline GPU Lion step doesn't apply
+
+On multi-GPU:
+- **fp32 master shards on GPU** (ZeRO-3 partitioning)
+- **No CPU offload**: optimizer state lives on GPU
+- **Fused Lion enabled**: inline updates in `_post_backward_hook`
+
+### 8.3 Single-GPU NCCL Device Pinning
+
+**Added 2026-06-17. Prevents `cuda:0` / `cuda:1` device mismatch on concurrent single-GPU runs.**
+
+When running two independent ZeroQ-train processes on separate GPUs (e.g., GPU 0 and GPU 1 concurrently), `_ensure_single_rank_pg` creates a single-rank NCCL process group. Without explicit device pinning, NCCL defaults to `cuda:0`, placing tensors on the wrong device.
+
+Fix in `steered_trainer.py:_ensure_single_rank_pg`:
+
+```python
+if device.type == 'cuda':
+    torch.cuda.set_device(device)   # Pin NCCL to the target GPU
+```
+
+Multi-GPU DDP is unaffected — `init_ddp` already sets the device, and `_ensure_single_rank_pg` exits early when `dist.is_initialized()` is True.
+
+### 8.4 Memory Fragmentation Mitigation (M40)
+
+**Added 2026-06-17. Prevents OOM from CUDA allocator fragmentation at batch=3/4 on 12GB M40.**
+
+The M40's CUDA allocator fragments memory under repeated per-layer gather/release cycles. Setting the environment variable:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+Allows the allocator to defragment by expanding reserved segments, avoiding "Tried to allocate 18MiB but 756MiB reserved" OOM failures. All pe3 launch scripts include this env var.
+
+### 8.5 Project Self-Containment
+
+**Added 2026-06-17. The `backends.py` module (TrainableSurface, ZeroQPartitionedBackend) previously lived in `~/deepseek_experiments/hybrid/` — an external dependency. Copied into `~/compiled_priors/backends.py` so the project is fully self-contained. No external repo dependencies.**
+
+### 8.6 Compiled Priors CLI Flag
+
+**Added 2026-06-17. `--priors-dir` replaces the hardcoded module-level `PRIOR_DIR` constant. Defaults to `compiled_priors_v3/` in the project directory. Priors are now project-local — no symlinks, no external drives, no silent failures.**
+
+```bash
+python steered_trainer.py ... --priors-dir ~/my_priors
+```
+
+### 8.7 Inject Layer Override
+
+**Added 2026-06-17. `--inject-layers` overrides the auto-computed `build_inject_layers()` for explicit control. Pinned-layers in `layer_split` mode now respect the override, keeping all inject layers on GPU 0 to prevent device mismatches with the steerer.**
+
+```bash
+python steered_trainer.py ... --inject-layers "5,10,20,24,28,32,36,46,53"
+```
 
 ## 9. Non-Goals (Explicitly Out of Scope)
 
